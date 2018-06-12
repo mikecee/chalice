@@ -101,6 +101,18 @@ def sample_app():
 
 
 @fixture
+def sample_app_with_cors():
+    demo = app.Chalice('demo-app')
+
+    @demo.route('/image', methods=['POST'], cors=True,
+                content_types=['image/gif'])
+    def image():
+        return {'image': True}
+
+    return demo
+
+
+@fixture
 def auth_request():
     method_arn = (
         "arn:aws:execute-api:us-west-2:123:rest-api-id/dev/GET/needs/auth")
@@ -110,7 +122,7 @@ def auth_request():
 
 @pytest.mark.skipif(sys.version[0] == '2',
                     reason=('Test is irrelevant under python 2, since str and '
-                            'bytes are interchangable.'))
+                            'bytes are interchangeable.'))
 def test_invalid_binary_response_body_throws_value_error(sample_app):
     response = app.Response(
         status_code=200,
@@ -260,6 +272,13 @@ def test_error_on_unsupported_method_gives_feedback_on_method(sample_app,
     assert 'POST' in json_response_body(raw_response)['Message']
 
 
+def test_error_contains_cors_headers(sample_app_with_cors, create_event):
+    event = create_event('/image', 'POST', {'not': 'image'})
+    raw_response = sample_app_with_cors(event, context=None)
+    assert raw_response['statusCode'] == 415
+    assert 'Access-Control-Allow-Origin' in raw_response['headers']
+
+
 def test_no_view_function_found(sample_app, create_event):
     bad_path = create_event('/noexist', 'GET', {})
     with pytest.raises(app.ChaliceError):
@@ -365,6 +384,21 @@ def test_json_body_available_with_right_content_type(create_event):
     result = demo(event, context=None)
     result = json_response_body(result)
     assert result == {'foo': 'bar'}
+
+
+def test_json_body_none_with_malformed_json(create_event):
+    demo = app.Chalice('demo-app')
+
+    @demo.route('/', methods=['POST'])
+    def index():
+        return demo.current_request.json_body
+
+    event = create_event('/', 'POST', {})
+    event['body'] = '{"foo": "bar"'
+
+    result = demo(event, context=None)
+    assert result['statusCode'] == 400
+    assert json_response_body(result)['Code'] == 'BadRequestError'
 
 
 def test_cant_access_json_body_with_wrong_content_type(create_event):

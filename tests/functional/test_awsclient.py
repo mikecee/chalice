@@ -15,6 +15,15 @@ from chalice.awsclient import DeploymentPackageTooLargeError
 from chalice.awsclient import LambdaClientError
 
 
+class FixedIDTypedAWSClient(TypedAWSClient):
+    def __init__(self, session, random_id):
+        super(FixedIDTypedAWSClient, self).__init__(session)
+        self._fixed_random_id = random_id
+
+    def _random_id(self):
+        return self._fixed_random_id
+
+
 def test_region_name_is_exposed(stubbed_session):
     assert TypedAWSClient(stubbed_session).region_name == 'us-west-2'
 
@@ -264,6 +273,36 @@ class TestGetRoleArn(object):
         stubbed_session.verify_stubs()
 
 
+class TestGetRole(object):
+    def test_get_role_success(self, stubbed_session):
+        today = datetime.datetime.today()
+        response = {
+            'Role': {
+                'Path': '/',
+                'RoleName': 'Yes',
+                'RoleId': 'abcd' * 4,
+                'CreateDate': today,
+                'Arn': 'good_arn' * 3,
+            }
+        }
+        stubbed_session.stub('iam').get_role(RoleName='Yes').returns(response)
+        stubbed_session.activate_stubs()
+        awsclient = TypedAWSClient(stubbed_session)
+        actual = awsclient.get_role(name='Yes')
+        assert actual == response['Role']
+        stubbed_session.verify_stubs()
+
+    def test_get_role_raises_exception_when_no_exists(self, stubbed_session):
+        stubbed_session.stub('iam').get_role(RoleName='Yes').raises_error(
+            error_code='NoSuchEntity',
+            message='Foo')
+        stubbed_session.activate_stubs()
+        awsclient = TypedAWSClient(stubbed_session)
+        with pytest.raises(ResourceDoesNotExistError):
+            awsclient.get_role(name='Yes')
+        stubbed_session.verify_stubs()
+
+
 class TestCreateRole(object):
     def test_create_role(self, stubbed_session):
         arn = 'good_arn' * 3
@@ -411,6 +450,27 @@ class TestCreateLambdaFunction(object):
             memory_size=256) == 'arn:12345:name'
         stubbed_session.verify_stubs()
 
+    def test_create_function_with_vpc_config(self, stubbed_session):
+        stubbed_session.stub('lambda').create_function(
+            FunctionName='name',
+            Runtime='python2.7',
+            Code={'ZipFile': b'foo'},
+            Handler='app.app',
+            Role='myarn',
+            VpcConfig={
+                'SecurityGroupIds': ['sg1', 'sg2'],
+                'SubnetIds': ['sn1', 'sn2']
+            }
+        ).returns({'FunctionArn': 'arn:12345:name'})
+        stubbed_session.activate_stubs()
+        awsclient = TypedAWSClient(stubbed_session)
+        assert awsclient.create_function(
+            'name', 'myarn', b'foo', 'python2.7', 'app.app',
+            subnet_ids=['sn1', 'sn2'],
+            security_group_ids=['sg1', 'sg2'],
+            ) == 'arn:12345:name'
+        stubbed_session.verify_stubs()
+
     def test_create_function_is_retried_and_succeeds(self, stubbed_session):
         kwargs = {
             'FunctionName': 'name',
@@ -436,6 +496,35 @@ class TestCreateLambdaFunction(object):
         assert awsclient.create_function(
             'name', 'myarn', b'foo',
             'python2.7', 'app.app') == 'arn:12345:name'
+        stubbed_session.verify_stubs()
+
+    def test_retry_happens_on_insufficient_permissions(self, stubbed_session):
+        # This can happen if we deploy a lambda in a VPC.  Instead of the role
+        # not being able to be assumed, we can instead not have permissions
+        # to modify ENIs.  These can be retried.
+        kwargs = {
+            'FunctionName': 'name',
+            'Runtime': 'python2.7',
+            'Code': {'ZipFile': b'foo'},
+            'Handler': 'app.app',
+            'Role': 'myarn',
+            'VpcConfig': {'SubnetIds': ['sn-1'],
+                          'SecurityGroupIds': ['sg-1']},
+        }
+        stubbed_session.stub('lambda').create_function(
+            **kwargs).raises_error(
+            error_code='InvalidParameterValueException',
+            message=('The provided execution role does not have permissions '
+                     'to call CreateNetworkInterface on EC2 be assumed by '
+                     'Lambda.'))
+        stubbed_session.stub('lambda').create_function(
+            **kwargs).returns({'FunctionArn': 'arn:12345:name'})
+        stubbed_session.activate_stubs()
+        awsclient = TypedAWSClient(stubbed_session, mock.Mock(spec=time.sleep))
+        assert awsclient.create_function(
+            'name', 'myarn', b'foo',
+            'python2.7', 'app.app', security_group_ids=['sg-1'],
+            subnet_ids=['sn-1']) == 'arn:12345:name'
         stubbed_session.verify_stubs()
 
     def test_create_function_fails_after_max_retries(self, stubbed_session):
@@ -661,6 +750,25 @@ class TestUpdateLambdaFunction(object):
         stubbed_session.activate_stubs()
         awsclient = TypedAWSClient(stubbed_session)
         awsclient.update_function('name', b'foo', memory_size=256)
+        stubbed_session.verify_stubs()
+
+    def test_update_function_with_vpc_config(self, stubbed_session):
+        lambda_client = stubbed_session.stub('lambda')
+        lambda_client.update_function_code(
+            FunctionName='name', ZipFile=b'foo').returns({})
+        lambda_client.update_function_configuration(
+            FunctionName='name', VpcConfig={
+                'SecurityGroupIds': ['sg1', 'sg2'],
+                'SubnetIds': ['sn1', 'sn2']
+            }
+        ).returns({})
+        stubbed_session.activate_stubs()
+        awsclient = TypedAWSClient(stubbed_session)
+        awsclient.update_function(
+            'name', b'foo',
+            subnet_ids=['sn1', 'sn2'],
+            security_group_ids=['sg1', 'sg2'],
+        )
         stubbed_session.verify_stubs()
 
     def test_update_function_with_adding_tags(self, stubbed_session):
@@ -911,11 +1019,12 @@ class TestAddPermissionsForAPIGateway(object):
             'function_name', 'us-west-2', '123', 'rest-api-id')
         stubbed_session.verify_stubs()
 
-    def should_call_add_permission(self, lambda_stub):
+    def should_call_add_permission(self, lambda_stub,
+                                   statement_id='random-id'):
         lambda_stub.add_permission(
             Action='lambda:InvokeFunction',
             FunctionName='name',
-            StatementId='random-id',
+            StatementId=statement_id,
             Principal='apigateway.amazonaws.com',
             SourceArn='arn:aws:execute-api:us-west-2:123:rest-api-id/*',
         ).returns({})
@@ -929,6 +1038,16 @@ class TestAddPermissionsForAPIGateway(object):
         client = TypedAWSClient(stubbed_session)
         client.add_permission_for_apigateway_if_needed(
             'name', 'us-west-2', '123', 'rest-api-id', 'random-id')
+        stubbed_session.verify_stubs()
+
+    def test_can_add_permission_random_id_optional(self, stubbed_session):
+        lambda_stub = stubbed_session.stub('lambda')
+        lambda_stub.get_policy(FunctionName='name').returns({'Policy': '{}'})
+        self.should_call_add_permission(lambda_stub, 'my-random-id')
+        stubbed_session.activate_stubs()
+        client = FixedIDTypedAWSClient(stubbed_session, 'my-random-id')
+        client.add_permission_for_apigateway_if_needed(
+            'name', 'us-west-2', '123', 'rest-api-id')
         stubbed_session.verify_stubs()
 
     def test_can_add_permission_for_apigateway_not_needed(self,

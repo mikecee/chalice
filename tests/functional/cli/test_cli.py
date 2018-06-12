@@ -9,11 +9,18 @@ import mock
 
 from chalice import cli
 from chalice.cli import factory
-from chalice.deploy.deployer import Deployer
-from chalice.config import Config
+from chalice.config import Config, DeployedResources
 from chalice.utils import record_deployed_values
-from chalice import local
 from chalice.constants import DEFAULT_APIGATEWAY_STAGE_NAME
+from chalice.logs import LogRetriever
+
+
+class FakeConfig(object):
+    def __init__(self, deployed_resources):
+        self._deployed_resources = deployed_resources
+
+    def deployed_resources(self, chalice_stage_name):
+        return self._deployed_resources
 
 
 @pytest.fixture
@@ -22,18 +29,10 @@ def runner():
 
 
 @pytest.fixture
-def mock_deployer():
-    d = mock.Mock(spec=Deployer)
-    d.deploy.return_value = {}
-    return d
-
-
-@pytest.fixture
-def mock_cli_factory(mock_deployer):
+def mock_cli_factory():
     cli_factory = mock.Mock(spec=factory.CLIFactory)
     cli_factory.create_config_obj.return_value = Config.create(project_dir='.')
     cli_factory.create_botocore_session.return_value = mock.sentinel.Session
-    cli_factory.create_default_deployer.return_value = mock_deployer
     return cli_factory
 
 
@@ -146,31 +145,8 @@ def test_can_package_with_single_file(runner):
             assert sorted(f.namelist()) == ['deployment.zip', 'sam.json']
 
 
-def test_can_deploy(runner, mock_cli_factory, mock_deployer):
-    deployed_values = {
-        'dev': {
-            # We don't need to fill in everything here.
-            'api_handler_arn': 'foo',
-            'rest_api_id': 'bar',
-        }
-    }
-    mock_deployer.deploy.return_value = deployed_values
-    with runner.isolated_filesystem():
-        cli.create_new_project_skeleton('testproject')
-        os.chdir('testproject')
-        result = _run_cli_command(runner, cli.deploy, [],
-                                  cli_factory=mock_cli_factory)
-        assert result.exit_code == 0
-        # We should have also created the deployed JSON file.
-        deployed_file = os.path.join('.chalice', 'deployed.json')
-        assert os.path.isfile(deployed_file)
-        with open(deployed_file) as f:
-            data = json.load(f)
-            assert data == deployed_values
-
-
-def test_does_deploy_with_default_api_gateway_stage_name(
-        runner, mock_cli_factory, mock_deployer):
+def test_does_deploy_with_default_api_gateway_stage_name(runner,
+                                                         mock_cli_factory):
     with runner.isolated_filesystem():
         cli.create_new_project_skeleton('testproject')
         os.chdir('testproject')
@@ -187,44 +163,7 @@ def test_does_deploy_with_default_api_gateway_stage_name(
         assert config.api_gateway_stage == DEFAULT_APIGATEWAY_STAGE_NAME
 
 
-def test_can_delete(runner, mock_cli_factory, mock_deployer):
-    deployed_values = {
-        'dev': {
-            'api_handler_arn': 'foo',
-            'rest_api_id': 'bar',
-        }
-    }
-    mock_deployer.delete.return_value = None
-    with runner.isolated_filesystem():
-        cli.create_new_project_skeleton('testproject')
-        os.chdir('testproject')
-        deployed_file = os.path.join('.chalice', 'deployed.json')
-        with open(deployed_file, 'wb') as f:
-            f.write(json.dumps(deployed_values).encode('utf-8'))
-        result = _run_cli_command(runner, cli.delete, [],
-                                  cli_factory=mock_cli_factory)
-
-        assert result.exit_code == 0
-        with open(deployed_file) as f:
-            data = json.load(f)
-            assert data == {}
-
-
-def test_can_specify_chalice_stage_arg(runner, mock_cli_factory,
-                                       mock_deployer):
-    with runner.isolated_filesystem():
-        cli.create_new_project_skeleton('testproject')
-        os.chdir('testproject')
-        result = _run_cli_command(runner, cli.deploy, ['--stage', 'prod'],
-                                  cli_factory=mock_cli_factory)
-        assert result.exit_code == 0
-
-    config = mock_cli_factory.create_config_obj.return_value
-    mock_deployer.deploy.assert_called_with(config, chalice_stage_name='prod')
-
-
-def test_can_specify_api_gateway_stage(runner, mock_cli_factory,
-                                       mock_deployer):
+def test_can_specify_api_gateway_stage(runner, mock_cli_factory):
     with runner.isolated_filesystem():
         cli.create_new_project_skeleton('testproject')
         os.chdir('testproject')
@@ -238,8 +177,7 @@ def test_can_specify_api_gateway_stage(runner, mock_cli_factory,
         )
 
 
-def test_can_deploy_specify_connection_timeout(runner, mock_cli_factory,
-                                               mock_deployer):
+def test_can_deploy_specify_connection_timeout(runner, mock_cli_factory):
     with runner.isolated_filesystem():
         cli.create_new_project_skeleton('testproject')
         os.chdir('testproject')
@@ -253,46 +191,44 @@ def test_can_deploy_specify_connection_timeout(runner, mock_cli_factory,
 
 
 def test_can_retrieve_url(runner, mock_cli_factory):
-    deployed_values = {
-        "dev": {
-            "rest_api_id": "rest_api_id",
-            "chalice_version": "0.7.0",
-            "region": "us-west-2",
-            "backend": "api",
-            "api_handler_name": "helloworld-dev",
-            "api_handler_arn": "arn:...",
-            "api_gateway_stage": "dev-apig",
-            "lambda_functions": {},
-        },
-        "prod": {
-            "rest_api_id": "rest_api_id_prod",
-            "chalice_version": "0.7.0",
-            "region": "us-west-2",
-            "backend": "api",
-            "api_handler_name": "helloworld-dev",
-            "api_handler_arn": "arn:...",
-            "api_gateway_stage": "prod-apig",
-            "lambda_functions": {},
-        },
+    deployed_values_dev = {
+        "schema_version": "2.0",
+        "resources": [
+            {"rest_api_url": "https://dev-url/",
+             "name": "rest_api",
+             "resource_type": "rest_api"},
+        ]
+    }
+    deployed_values_prod = {
+        "schema_version": "2.0",
+        "resources": [
+            {"rest_api_url": "https://prod-url/",
+             "name": "rest_api",
+             "resource_type": "rest_api"},
+        ]
     }
     with runner.isolated_filesystem():
         cli.create_new_project_skeleton('testproject')
         os.chdir('testproject')
-        record_deployed_values(deployed_values,
-                               os.path.join('.chalice', 'deployed.json'))
+        deployed_dir = os.path.join('.chalice', 'deployed')
+        os.makedirs(deployed_dir)
+        record_deployed_values(
+            deployed_values_dev,
+            os.path.join(deployed_dir, 'dev.json')
+        )
+        record_deployed_values(
+            deployed_values_prod,
+            os.path.join(deployed_dir, 'prod.json')
+        )
         result = _run_cli_command(runner, cli.url, [],
                                   cli_factory=mock_cli_factory)
         assert result.exit_code == 0
-        assert result.output == (
-            'https://rest_api_id.execute-api.us-west-2.amazonaws.com'
-            '/dev-apig/\n')
+        assert result.output == 'https://dev-url/\n'
 
         prod_result = _run_cli_command(runner, cli.url, ['--stage', 'prod'],
                                        cli_factory=mock_cli_factory)
         assert prod_result.exit_code == 0
-        assert prod_result.output == (
-            'https://rest_api_id_prod.execute-api.us-west-2.amazonaws.com'
-            '/prod-apig/\n')
+        assert prod_result.output == 'https://prod-url/\n'
 
 
 def test_error_when_no_deployed_record(runner, mock_cli_factory):
@@ -381,22 +317,6 @@ def test_can_extract_buildspec_yaml(runner):
             assert 'chalice package' in data
 
 
-def test_env_vars_set_in_local(runner, mock_cli_factory,
-                               monkeypatch):
-    local_server = mock.Mock(spec=local.LocalDevServer)
-    mock_cli_factory.create_local_server.return_value = local_server
-    mock_cli_factory.create_config_obj.return_value = Config.create(
-        project_dir='.', environment_variables={'foo': 'bar'})
-    actual_env = {}
-    monkeypatch.setattr(os, 'environ', actual_env)
-    with runner.isolated_filesystem():
-        cli.create_new_project_skeleton('testproject')
-        os.chdir('testproject')
-        _run_cli_command(runner, cli.local, [],
-                         cli_factory=mock_cli_factory)
-        assert actual_env['foo'] == 'bar'
-
-
 def test_can_specify_profile_for_logs(runner, mock_cli_factory):
     with runner.isolated_filesystem():
         cli.create_new_project_skeleton('testproject')
@@ -407,3 +327,30 @@ def test_can_specify_profile_for_logs(runner, mock_cli_factory):
         )
         assert result.exit_code == 0
         assert mock_cli_factory.profile == 'my-profile'
+
+
+def test_can_provide_lambda_name_for_logs(runner, mock_cli_factory):
+    deployed_resources = DeployedResources({
+        "resources": [
+            {"name": "foo",
+             "lambda_arn": "arn:aws:lambda::app-dev-foo",
+             "resource_type": "lambda_function"}]
+    })
+    mock_cli_factory.create_config_obj.return_value = FakeConfig(
+        deployed_resources)
+    log_retriever = mock.Mock(spec=LogRetriever)
+    log_retriever.retrieve_logs.return_value = []
+    mock_cli_factory.create_log_retriever.return_value = log_retriever
+    with runner.isolated_filesystem():
+        cli.create_new_project_skeleton('testproject')
+        os.chdir('testproject')
+        result = _run_cli_command(
+            runner, cli.logs, ['--name', 'foo'],
+            cli_factory=mock_cli_factory
+        )
+        assert result.exit_code == 0
+    log_retriever.retrieve_logs.assert_called_with(
+        include_lambda_messages=False, max_entries=None)
+    mock_cli_factory.create_log_retriever.assert_called_with(
+        mock.sentinel.Session, 'arn:aws:lambda::app-dev-foo'
+    )

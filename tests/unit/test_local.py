@@ -534,6 +534,7 @@ def test_can_create_lambda_event():
         'requestContext': {
             'httpMethod': 'GET',
             'resourcePath': '/foo/{capture}',
+            'path': '/foo/other',
             'identity': {
                 'sourceIp': local.LambdaEventConverter.LOCAL_SOURCE_IP
             },
@@ -541,6 +542,31 @@ def test_can_create_lambda_event():
         'headers': {'content-type': 'application/json'},
         'pathParameters': {'capture': 'other'},
         'queryStringParameters': None,
+        'body': None,
+        'stageVariables': {},
+    }
+
+
+def test_parse_query_string():
+    converter = local.LambdaEventConverter(
+        local.RouteMatcher(['/foo/bar', '/foo/{capture}']))
+    event = converter.create_lambda_event(
+        method='GET',
+        path='/foo/other?a=1&b=&c=3',
+        headers={'content-type': 'application/json'}
+    )
+    assert event == {
+        'requestContext': {
+            'httpMethod': 'GET',
+            'resourcePath': '/foo/{capture}',
+            'path': '/foo/other',
+            'identity': {
+                'sourceIp': local.LambdaEventConverter.LOCAL_SOURCE_IP
+            },
+        },
+        'headers': {'content-type': 'application/json'},
+        'pathParameters': {'capture': 'other'},
+        'queryStringParameters': {'a': '1', 'b': '', 'c': '3'},
         'body': None,
         'stageVariables': {},
     }
@@ -559,6 +585,7 @@ def test_can_create_lambda_event_for_put_request():
         'requestContext': {
             'httpMethod': 'PUT',
             'resourcePath': '/foo/{capture}',
+            'path': '/foo/other',
             'identity': {
                 'sourceIp': local.LambdaEventConverter.LOCAL_SOURCE_IP
             },
@@ -585,6 +612,7 @@ def test_can_create_lambda_event_for_post_with_formencoded_body():
         'requestContext': {
             'httpMethod': 'POST',
             'resourcePath': '/foo/{capture}',
+            'path': '/foo/other',
             'identity': {
                 'sourceIp': local.LambdaEventConverter.LOCAL_SOURCE_IP
             },
@@ -997,7 +1025,7 @@ class TestLocalDevServer(object):
         dev_server.serve_forever()
         http_server.serve_forever.assert_called_with()
 
-    def test_host_and_port_forwarded_to_server_creation(self):
+    def test_host_and_port_forwarded_to_server_creation(self, sample_app):
         provided_args = []
 
         def args_recorder(*args):
@@ -1009,3 +1037,10 @@ class TestLocalDevServer(object):
         )
 
         assert provided_args[0] == ('0.0.0.0', 8000)
+
+    def test_does_use_daemon_threads(self, sample_app):
+        server = LocalDevServer(
+            sample_app, Config(), '0.0.0.0', 8000
+        )
+
+        assert server.server.daemon_threads

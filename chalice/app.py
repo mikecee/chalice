@@ -9,7 +9,9 @@ import decimal
 import base64
 from collections import defaultdict, Mapping
 
-__version__ = '1.1.0'
+
+__version__ = '1.3.0'
+
 
 # Implementation note:  This file is intended to be a standalone file
 # that gets copied into the lambda deployment package.  It has no dependencies
@@ -38,9 +40,11 @@ def handle_decimals(obj):
     return obj
 
 
-def error_response(message, error_code, http_status_code):
+def error_response(message, error_code, http_status_code, headers=None):
     body = {'Code': error_code, 'Message': message}
-    response = Response(body=body, status_code=http_status_code)
+    response = Response(body=body, status_code=http_status_code,
+                        headers=headers)
+
     return response.to_dict()
 
 
@@ -104,6 +108,7 @@ ALL_ERRORS = [
     NotFoundError,
     UnauthorizedError,
     ForbiddenError,
+    MethodNotAllowedError,
     RequestTimeoutError,
     ConflictError,
     UnprocessableEntityError,
@@ -300,7 +305,10 @@ class Request(object):
     def json_body(self):
         if self.headers.get('content-type', '').startswith('application/json'):
             if self._json_body is None:
-                self._json_body = json.loads(self.raw_body)
+                try:
+                    self._json_body = json.loads(self.raw_body)
+                except ValueError:
+                    raise BadRequestError('Error Parsing JSON')
             return self._json_body
 
     def to_dict(self):
@@ -412,6 +420,7 @@ class APIGateway(object):
         'audio/webm',
         'image/png',
         'image/jpg',
+        'image/jpeg',
         'image/gif',
         'video/ogg',
         'video/mpeg',
@@ -603,6 +612,11 @@ class Chalice(object):
                                        event['requestContext'],
                                        event['stageVariables'],
                                        event.get('isBase64Encoded', False))
+        # We're getting the CORS headers before validation to be able to
+        # output desired headers with
+        cors_headers = None
+        if self._cors_enabled_for_route(route_entry):
+            cors_headers = self._get_cors_headers(route_entry.cors)
         # We're doing the header validation after creating the request
         # so can leverage the case insensitive dict that the Request class
         # uses for headers.
@@ -615,11 +629,12 @@ class Chalice(object):
                     error_code='UnsupportedMediaType',
                     message='Unsupported media type: %s' % content_type,
                     http_status_code=415,
+                    headers=cors_headers
                 )
         response = self._get_view_function_response(view_function,
                                                     function_args)
-        if self._cors_enabled_for_route(route_entry):
-            self._add_cors_headers(response, route_entry.cors)
+        if cors_headers is not None:
+            self._add_cors_headers(response, cors_headers)
 
         response_headers = CaseInsensitiveMapping(response.headers)
         if not self._validate_binary_response(
@@ -632,7 +647,8 @@ class Chalice(object):
                          'response has a binary Content-Type then the request '
                          'must specify an Accept header that matches.'
                          % (content_type, content_type)),
-                http_status_code=400
+                http_status_code=400,
+                headers=cors_headers
             )
         response = response.to_dict(self.api.binary_types)
         return response
@@ -692,8 +708,11 @@ class Chalice(object):
     def _cors_enabled_for_route(self, route_entry):
         return route_entry.cors is not None
 
-    def _add_cors_headers(self, response, cors):
-        for name, value in cors.get_access_control_headers().items():
+    def _get_cors_headers(self, cors):
+        return cors.get_access_control_headers()
+
+    def _add_cors_headers(self, response, cors_headers):
+        for name, value in cors_headers.items():
             if name not in response.headers:
                 response.headers[name] = value
 

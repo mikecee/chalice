@@ -3,16 +3,16 @@ import os
 import json
 import importlib
 import logging
+import functools
 
 from botocore.config import Config as BotocoreConfig
 from botocore.session import Session
-from typing import Any, Optional, Dict  # noqa
+from typing import Any, Optional, Dict, MutableMapping  # noqa
 
 from chalice import __version__ as chalice_version
 from chalice.awsclient import TypedAWSClient
 from chalice.app import Chalice  # noqa
 from chalice.config import Config
-from chalice.deploy import deployer
 from chalice.package import create_app_packager
 from chalice.package import AppPackager  # noqa
 from chalice.constants import DEFAULT_STAGE_NAME
@@ -20,6 +20,7 @@ from chalice.constants import DEFAULT_APIGATEWAY_STAGE_NAME
 from chalice.logs import LogRetriever
 from chalice import local
 from chalice.utils import UI  # noqa
+from chalice.deploy import deployer  # noqa
 
 
 def create_botocore_session(profile=None, debug=False,
@@ -76,11 +77,14 @@ class LargeRequestBodyFilter(logging.Filter):
 
 
 class CLIFactory(object):
-    def __init__(self, project_dir, debug=False, profile=None):
-        # type: (str, bool, Optional[str]) -> None
+    def __init__(self, project_dir, debug=False, profile=None, environ=None):
+        # type: (str, bool, Optional[str], Optional[MutableMapping]) -> None
         self.project_dir = project_dir
         self.debug = debug
         self.profile = profile
+        if environ is None:
+            environ = dict(os.environ)
+        self._environ = environ
 
     def create_botocore_session(self, connection_timeout=None):
         # type: (int) -> Session
@@ -88,10 +92,18 @@ class CLIFactory(object):
                                        debug=self.debug,
                                        connection_timeout=connection_timeout)
 
-    def create_default_deployer(self, session, ui):
+    def create_default_deployer(self, session, config, ui):
+        # type: (Session, Config, UI) -> deployer.Deployer
+        return deployer.create_default_deployer(session, config, ui)
+
+    def create_deletion_deployer(self, session, ui):
         # type: (Session, UI) -> deployer.Deployer
-        return deployer.create_default_deployer(
-            session=session, ui=ui)
+        return deployer.create_deletion_deployer(
+            TypedAWSClient(session), ui)
+
+    def create_deployment_reporter(self, ui):
+        # type: (UI) -> deployer.DeploymentReporter
+        return deployer.DeploymentReporter(ui=ui)
 
     def create_config_obj(self, chalice_stage_name=DEFAULT_STAGE_NAME,
                           autogen_policy=None,
@@ -111,8 +123,6 @@ class CLIFactory(object):
                                % err)
 
         self._validate_config_from_disk(config_from_disk)
-        app_obj = self.load_chalice_app()
-        user_provided_params['chalice_app'] = app_obj
         if autogen_policy is not None:
             user_provided_params['autogen_policy'] = autogen_policy
         if self.profile is not None:
@@ -123,6 +133,8 @@ class CLIFactory(object):
                         user_provided_params=user_provided_params,
                         config_from_disk=config_from_disk,
                         default_params=default_params)
+        user_provided_params['chalice_app'] = functools.partial(
+            self.load_chalice_app, config.environment_variables)
         return config
 
     def _validate_config_from_disk(self, config):
@@ -142,11 +154,11 @@ class CLIFactory(object):
     def create_log_retriever(self, session, lambda_arn):
         # type: (Session, str) -> LogRetriever
         client = TypedAWSClient(session)
-        retriever = LogRetriever.create_from_arn(client, lambda_arn)
+        retriever = LogRetriever.create_from_lambda_arn(client, lambda_arn)
         return retriever
 
-    def load_chalice_app(self):
-        # type: () -> Chalice
+    def load_chalice_app(self, environment_variables=None):
+        # type: (Optional[MutableMapping]) -> Chalice
         if self.project_dir not in sys.path:
             sys.path.insert(0, self.project_dir)
         # The vendor directory has its contents copied up to the top level of
@@ -168,6 +180,8 @@ class CLIFactory(object):
             # version locally and still keep the lambda
             # specific one in vendor/
             sys.path.append(vendor_dir)
+        if environment_variables is not None:
+            self._environ.update(environment_variables)
         try:
             app = importlib.import_module('app')
             chalice_app = getattr(app, 'app')
